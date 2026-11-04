@@ -20,7 +20,8 @@ class FSDP(torch.nn.Module):
 
     # forward 之后恢复原来的权重
     def forward_post_hook(self, module, args, output):
-        module.weight.data = module.weight._saved_fp32
+        module.weight.data = module.weight._saved_fp32  # 释放点：换回分片后，参数不再引用 gather 出的完整权重。Embedding 的完整权重在这里就被释放。
+        # NOTE Linear 的不会：autograd 为 backward 保存了它的视图，要到这一层的 backward 结束才释放。
 
     # reduce-scatter (synchronous in basic implementation)
     def reduce_scatter_grad(self, weight, full_grad):
@@ -31,8 +32,9 @@ class FSDP(torch.nn.Module):
     # backward 之后恢复原来的权重
     def backward_post_hook(self, weight):
         tensor, handle = self.reduce_scatter_grad(weight, weight.grad)
-        weight.grad = None
-        weight.data = weight._saved_fp32
+        weight.grad = None  # 释放点：去掉参数对完整梯度的引用。基础版的 reduce-scatter 已同步完成，完整梯度在这里就被释放；
+        # Async 及其子类还在通信，完整梯度由 ongoing_communication_params 继续持有，到 finish 才释放。
+        weight.data = weight._saved_fp32  # 释放点：换回分片，释放 backward 前重新 gather 的完整权重(NOTE 只有 Linear 有这个步骤，对应forward_post_hook里的Linear层不能释放)
         self.sharded_params_temp.append((weight, tensor, handle))
 
     # all reduce (synchronous in basic implementation)
@@ -55,6 +57,7 @@ class FSDP(torch.nn.Module):
         for param in self.module.parameters():
             dist.broadcast(param.data, src=0)
         self.unsharded_params = []
+        self.hook_handles = []
         self.sharded_params = set()
 
         self.sharded_params_temp = []
@@ -66,20 +69,30 @@ class FSDP(torch.nn.Module):
                 self.sharded_params.add(mod.weight)
                 # 每个rank只保留一部分权重
                 mod.weight._full_shape = mod.weight.shape
+                # 权重释放点
+                # 1. 张量分两层：张量对象记录形状、stride、偏移量。真正的内存在底层的 storage 里。多个张量(比如视图)可以共享同一个 storage。
+                #    storage 靠引用计数管理：最后一个引用它的张量消失时，内存立刻释放，不用等垃圾回收。
+                # 2. torch.chunk 返回的是视图，和完整权重共用同一个 storage；.clone() 才会新分配一块 1/N 大小的 storage，并把这一片的数据拷过去。
+                # 3. 给 mod.weight.data 赋值不会换掉参数对象(optimizer 和 hook 拿到的还是同一个对象)，只是把参数内部指向的 storage 换成分片的那块。
+                #    完整 storage 随之失去最后一个引用，在这一行就被释放。(CUDA 上内存回到 PyTorch 的缓存分配器：
+                #    memory_allocated 下降，memory_reserved 不变)
+                # 4. 如果不 clone，参数会通过视图继续引用整块完整 storage，显存一点都没省。
+                # 前提：没有别的引用指向完整权重。其他变量、它的视图、autograd 为 backward 保存的张量，都会让它继续存活。
+                # 验证：赋值前后看 mod.weight.untyped_storage().nbytes()，应从完整大小变成约 1/N。
                 chunk = torch.chunk(mod.weight.data, self.world_size, dim=0)[self.rank].clone()
                 mod.weight.data = chunk
-                mod.register_forward_pre_hook(self.gather_weight_pre_hook)
-                mod.register_forward_hook(self.forward_post_hook)
+                self.hook_handles.append(mod.register_forward_pre_hook(self.gather_weight_pre_hook))
+                self.hook_handles.append(mod.register_forward_hook(self.forward_post_hook))
                 if isinstance(mod, Linear):
-                    mod.register_full_backward_pre_hook(self.gather_weight_pre_hook)
-                mod.weight.register_post_accumulate_grad_hook(self.backward_post_hook)
+                    self.hook_handles.append(mod.register_full_backward_pre_hook(self.gather_weight_pre_hook))
+                self.hook_handles.append(mod.weight.register_post_accumulate_grad_hook(self.backward_post_hook))
         for param in self.module.parameters():
             if param in self.sharded_params:
                 continue
             if not param.requires_grad:
                 continue
             self.unsharded_params.append(param)
-            param.register_post_accumulate_grad_hook(self.unsharded_grad_hook)
+            self.hook_handles.append(param.register_post_accumulate_grad_hook(self.unsharded_grad_hook))
 
     def forward(self, *args, **kwargs):
         return self.module(*args, **kwargs)
@@ -94,6 +107,8 @@ class FSDP(torch.nn.Module):
             if handle is not None:
                 handle.wait()
             param.grad /= self.world_size
+        # 释放点：清空临时列表，丢掉对 handle 和分片梯度缓冲区的引用。分片梯度此时已交给 .grad，由 optimizer 的 zero_grad 释放。
+        # NOTE：每次 backward 后都必须调用 finish，否则这两个列表会跨步累积。
         self.sharded_params_temp.clear()
         self.unsharded_params_temp.clear()
 
@@ -107,6 +122,22 @@ class FSDP(torch.nn.Module):
             else:
                 full_params[param_name] = param.data
         return full_params
+
+    # remove_hooks:丢弃这个实例之前调用，让模型 del 后能立刻释放内存，避免引用环泄漏
+    # 原理：
+    #   hook 注册的是绑定方法 self.xxx，形成"参数 → hook → self → 模型 → 参数"的引用环；其中 post-accumulate-grad hook 形成的环连 gc.collect() 都回收不了。
+    #   对 register_* 返回的 handle 调用 remove() 删掉 hook，环断开后靠引用计数立刻释放。
+    # 先调用 finish：等完还在进行的异步通信，避免释放正在被读写的张量(PrefetchFSDP 会另外处理 prefetch_dict)。
+    # 用法：只在同一进程里还要再建模型时需要(比如 benchmark 依次比较各版本)：
+    #       先 remove_hooks()，再 del 包装器、optimizer、output 和 loss。调用后这个实例不能再用来训练。
+    #       不能放进 __del__：泄漏存在时对象不会被销毁，__del__ 根本不会执行。
+    def remove_hooks(self):
+        self.finish_gradient_synchronization()
+        for handle in self.hook_handles:
+            handle.remove()
+        self.hook_handles.clear()
+        self.sharded_params_temp.clear()
+        self.unsharded_params_temp.clear()
 
 # Add async communication for reduce_scatter_grad/all_reduce
 class AsyncFSDP(FSDP):
@@ -127,7 +158,7 @@ class AsyncFSDP(FSDP):
 
     def finish_gradient_synchronization(self):
         super().finish_gradient_synchronization()
-        self.ongoing_communication_params.clear()
+        self.ongoing_communication_params.clear()  # 释放点：所有 handle 已在父类的 finish 里 wait 完，这里释放全部完整梯度。
 
 class PrefetchFSDP(AsyncFSDP):
     # 在AsyncFSDP的基础上，给forward的all-gather加上“提前两层”的预取
@@ -166,7 +197,7 @@ class PrefetchFSDP(AsyncFSDP):
             self.execute_seq.append(module)
         # 后面forward时，如果模块已经在预取字典中，等待预取完成并替换权重
         if module in self.prefetch_dict:
-            tensor, handle = self.prefetch_dict.pop(module)
+            tensor, handle = self.prefetch_dict.pop(module)  # 释放点：从 prefetch_dict 取出，去掉字典对缓冲区的引用。wait 之后缓冲区换进 .data，之后在 forward_post_hook 里释放。
             handle.wait()
             module.weight._saved_fp32 = module.weight.data
             module.weight.data = tensor
@@ -179,8 +210,8 @@ class PrefetchFSDP(AsyncFSDP):
         # 如果已经记录了执行顺序(说明已经完成了第一次forward)，预取第p+2层，提前两层发起gather
         if self.recorded:
             p = self.layer_position_map[module]
-            if p+2 < len(self.execute_seq):
-                next_module = self.execute_seq[p+2]
+            if p + 2 < len(self.execute_seq):
+                next_module = self.execute_seq[p + 2]
                 self.start_prefetch(next_module)
 
     def forward(self, *args, **kwargs):
@@ -197,6 +228,12 @@ class PrefetchFSDP(AsyncFSDP):
                 self.layer_position_map[module] = i
             self.recorded = True
         return output
+
+    def remove_hooks(self):
+        for tensor, handle in self.prefetch_dict.values():
+            handle.wait()
+        self.prefetch_dict.clear()
+        super().remove_hooks()
 
 
 class MixedPrecisionFSDP(PrefetchFSDP):

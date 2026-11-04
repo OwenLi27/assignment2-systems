@@ -12,10 +12,11 @@ class OverlapDDP(torch.nn.Module):
         for buffer in self.module.buffers():
             dist.broadcast(buffer.data, src=0)
         self.handles = []
+        self.hook_handles = []
         self.world_size = dist.get_world_size()
         for param in self.module.parameters():
             if param.requires_grad:
-                param.register_post_accumulate_grad_hook(self.hook)
+                self.hook_handles.append(param.register_post_accumulate_grad_hook(self.hook))
 
     def hook(self, param):
         param.grad /= self.world_size
@@ -29,3 +30,9 @@ class OverlapDDP(torch.nn.Module):
         for handle in self.handles:
             handle.wait()
         self.handles = []
+
+    def remove_hooks(self):
+        self.finish_gradient_synchronization()
+        for hook_handle in self.hook_handles:
+            hook_handle.remove()
+        self.hook_handles.clear()
